@@ -3,11 +3,11 @@
 class Theyos < Formula
   desc "theyOS - Multi-tenant AI assistant platform for macOS"
   homepage "https://github.com/soyeht/theyos"
-  version "0.1.0"
+  version "0.1.1"
 
   on_arm do
-    url "https://github.com/soyeht/theyos/releases/download/v0.1.0/theyos-0.1.0-macos-arm64.tar.gz"
-    sha256 "582003bf3e07b4305f8f449c5212e3b2a45b489367a7393964e809bd44c2aed0"
+    url "https://github.com/soyeht/theyos/releases/download/v0.1.1/theyos-0.1.1-macos-arm64.tar.gz"
+    sha256 "af729714d6d6b4edd63ee3eef65e705aed94e08e160dc635bf988a9cd5ea2c7a"
   end
 
   on_intel do
@@ -15,6 +15,11 @@ class Theyos < Formula
   end
 
   depends_on macos: :sonoma # VZ Framework requires macOS 14+
+
+  def pre_install
+    stop_theyos_service
+    terminate_theyos_processes
+  end
 
   def install
     # All real binaries → libexec (not on PATH)
@@ -73,6 +78,13 @@ class Theyos < Formula
         echo "[theyos] Config: $THEYOS_DIR/.env"
       fi
     SH
+    wrapper_body += <<~'SH'
+      if [ ! -f "$THEYOS_DIR/bootstrap-token" ]; then
+        openssl rand -base64 32 > "$THEYOS_DIR/bootstrap-token"
+        chmod 600 "$THEYOS_DIR/bootstrap-token"
+        echo "[theyos] Generated bootstrap token at $THEYOS_DIR/bootstrap-token"
+      fi
+    SH
 
     (bin/"soyeht").write(wrapper_body + "exec \"#{opt_libexec}/soyeht\" \"$@\"\n")
     (bin/"soyeht").chmod(0o755)
@@ -100,6 +112,7 @@ class Theyos < Formula
       WEB_DIR:                       (opt_libexec/"web").to_s,
       THEYOS_SSH_CTL:                (opt_libexec/"theyos-ssh").to_s,
       THEYOS_VMRUNNER_MACOS_RS_BIN:  (opt_libexec/"vmrunner_macos_ipc").to_s,
+      THEYOS_BOOTSTRAP_TOKEN_PATH:   "#{Dir.home}/.theyos/bootstrap-token",
       HOME:                          Dir.home,
     )
   end
@@ -128,9 +141,16 @@ class Theyos < Formula
       Important: don't mix manual (soyeht start/stop) with
       launchd (brew services start/stop). Pick one.
 
-      Cleanup (removes all data, VMs, ~100GB):
+      Clean uninstall (stops helpers + removes launch agent residue):
+        soyeht cleanup-homebrew
         brew uninstall theyos
-        rm -rf ~/.theyos ~/Library/Application\\ Support/theyos
+
+      Full purge (removes data, VMs, logs, caches, launch agent, ~100GB):
+        soyeht cleanup-homebrew --purge-data
+        brew uninstall theyos
+
+      If purge hits EACCES in macos-base, fix ownership first:
+        sudo chown -R $(whoami):staff ~/Library/Application\\ Support/theyos/vms/macos-base
     EOS
   end
 
@@ -139,5 +159,80 @@ class Theyos < Formula
     system bin/"soyeht", "--help"
     assert_predicate opt_libexec/"server", :exist?
     assert_predicate opt_libexec/"vmrunner_macos_ipc", :exist?
+  end
+
+  private
+
+  def managed_process_names
+    %w[
+      theyos-admin-host
+      server
+      executor_ipc
+      store-ipc
+      terminal-ipc
+      vmrunner_macos_ipc
+      theyos-provision-inject
+    ]
+  end
+
+  def stop_theyos_service
+    return unless OS.mac?
+
+    system "brew", "services", "stop", name.to_s
+
+    launch_agent_paths.each do |plist|
+      next unless plist.exist?
+
+      system "launchctl", "bootout", "gui/#{Process.uid}", plist.to_s
+      system "launchctl", "unload", "-w", plist.to_s
+    end
+  end
+
+  def terminate_theyos_processes
+    pids = managed_processes.map(&:first)
+    return if pids.empty?
+
+    Process.kill("TERM", *pids)
+    sleep 2
+
+    survivors = pids.select { |pid| process_alive?(pid) }
+    Process.kill("KILL", *survivors) unless survivors.empty?
+  rescue Errno::ESRCH
+    nil
+  end
+
+  def managed_processes
+    IO.popen(["ps", "-axo", "pid=,command="], &:read).each_line.filter_map do |line|
+      pid_str, command = line.strip.split(/\s+/, 2)
+      next if pid_str.nil? || command.nil?
+      next unless managed_command?(command)
+
+      [pid_str.to_i, command]
+    end
+  end
+
+  def managed_command?(command)
+    return false unless command.include?("/libexec/")
+    return false unless command.start_with?("#{HOMEBREW_PREFIX}/opt/theyos/",
+                                            "#{HOMEBREW_PREFIX}/Cellar/theyos/")
+
+    managed_process_names.any? { |binary| command.include?("/libexec/#{binary}") }
+  end
+
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::EPERM
+    true
+  rescue Errno::ESRCH
+    false
+  end
+
+  def launch_agent_paths
+    [
+      Pathname.new("#{Dir.home}/Library/LaunchAgents/homebrew.mxcl.#{name}.plist"),
+      Pathname.new("#{HOMEBREW_PREFIX}/opt/homebrew.mxcl.#{name}.plist"),
+      prefix/"homebrew.mxcl.#{name}.plist",
+    ]
   end
 end

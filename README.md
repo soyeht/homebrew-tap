@@ -22,3 +22,17 @@ soyeht start
 ```
 
 This downloads macOS and creates the base VM image (~30 min first time).
+
+## Uninstall
+
+```bash
+soyeht cleanup-homebrew
+brew uninstall theyos
+```
+
+For a full purge, remove the user data and VMs too:
+
+```bash
+soyeht cleanup-homebrew --purge-data
+brew uninstall theyos
+```
